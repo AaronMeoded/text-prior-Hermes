@@ -134,7 +134,8 @@ class PriorInitFusionLayer(nn.Module):
         for i in range(block_num):
             self.attn_layers.append(PriorAttentionBlock(feat_dim, heads=feat_dim//32, dim_head=32, attn_drop=0, proj_drop=0))
 
-    def forward(self, x, tgt_idx, mod_idx):
+    # def forward(self, x, tgt_idx, mod_idx):
+    def forward(self, x, tgt_idx, mod_idx, text_priors):
         # x: image feature map, tgt_idx: target task index, mod_idx: modality index
         B, C, D, H, W = x.shape
         
@@ -151,7 +152,8 @@ class PriorInitFusionLayer(nn.Module):
         modality_priors = torch.stack(modality_prior_list)
         modality_priors = modality_priors.squeeze(1)
 
-        priors = torch.cat([task_priors, modality_priors], dim=1)
+        # priors = torch.cat([task_priors, modality_priors], dim=1)
+        priors = torch.cat([task_priors, modality_priors, text_priors], dim=1)
         
         #x = rearrange(x, 'b c d h w -> b (d h w) c', d=D, h=H, w=W)
         b, c, d, h, w = x.shape
