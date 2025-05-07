@@ -1,134 +1,170 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .hermes_unet_utils import inconv, down_block, up_block, PriorInitFusionLayer
-from .hermes_utils import HierarchyPriorClassifier, ModalityClassifier
-from .utils import get_block, get_norm
+from .conv_layers import BasicBlock, Bottleneck, ConvNormAct
+from .trans_layers import Attention, CrossAttention, LayerNorm, Mlp, PreNorm
 import pdb
+from einops import rearrange
 
-class Hermes_UNet(nn.Module):
-    def __init__(
-        self,
-        in_ch,
-        base_ch,
-        scale=[2,2,2,2],
-        kernel_size=[3,3,3,3],
-        block='BasicBlock',
-        num_block=[2,2,2,2],
-        pool=True,
-        norm='in',
-        tn=72,
-        mn=6,
-        embed_dim=1536,
-        text_prior_num=4
-    ):
+class inconv(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size=[3,3,3], block=BasicBlock, norm=nn.BatchNorm3d):
         super().__init__()
-        # store parameters for forward use
-        self.base_ch = base_ch
-        self.embed_dim = embed_dim
-        self.text_prior_num = text_prior_num
 
-        # resolve block and norm functions
-        block_fn = get_block(block)
-        norm_fn = get_norm(norm)
+        if isinstance(kernel_size, int):
+            kernel_size = [kernel_size] * 3
+        pad_size = [i//2 for i in kernel_size]
+        self.conv1 = nn.Conv3d(in_ch, out_ch, kernel_size=kernel_size, padding=pad_size, bias=False)
+        self.conv2 = block(out_ch, out_ch, kernel_size=kernel_size, norm=norm)
 
-        # U-Net encoder
-        self.inc = inconv(in_ch, base_ch, block=block_fn, kernel_size=kernel_size[0], norm=norm_fn)
-        self.down1 = down_block(base_ch, 2*base_ch, num_block=num_block[0], block=block_fn,
-                                pool=pool, down_scale=scale[0], kernel_size=kernel_size[1], norm=norm_fn)
-        self.down2 = down_block(2*base_ch, 4*base_ch, num_block=num_block[1], block=block_fn,
-                                pool=pool, down_scale=scale[1], kernel_size=kernel_size[2], norm=norm_fn)
-        self.prior_init_fuse_2 = PriorInitFusionLayer(
-            4*base_ch, 4*base_ch, block_num=2, task_prior_num=tn, modality_prior_num=mn
-        )
-        self.down3 = down_block(4*base_ch, 8*base_ch, num_block=num_block[2], block=block_fn,
-                                pool=pool, down_scale=scale[2], kernel_size=kernel_size[3], norm=norm_fn)
-        self.prior_init_fuse_3 = PriorInitFusionLayer(
-            8*base_ch, 8*base_ch, block_num=2, task_prior_num=tn, modality_prior_num=mn
-        )
-        self.down4 = down_block(8*base_ch, 10*base_ch, num_block=num_block[3], block=block_fn,
-                                pool=pool, down_scale=scale[3], kernel_size=kernel_size[4], norm=norm_fn)
-        self.prior_init_fuse_4 = PriorInitFusionLayer(
-            10*base_ch, 10*base_ch, block_num=4, task_prior_num=tn, modality_prior_num=mn
-        )
+    def forward(self, x): 
+        out = self.conv1(x)
+        out = self.conv2(out)
 
-        # U-Net decoder
-        self.up1 = up_block(10*base_ch, 8*base_ch, num_block=num_block[2], block=block_fn,
-                            up_scale=scale[3], kernel_size=kernel_size[3], norm=norm_fn)
-        self.prior_fuse_5 = PriorInitFusionLayer(
-            8*base_ch, 8*base_ch, block_num=2, task_prior_num=tn, modality_prior_num=mn
-        )
-        self.up2 = up_block(8*base_ch, 4*base_ch, num_block=num_block[1], block=block_fn,
-                            up_scale=scale[2], kernel_size=kernel_size[2], norm=norm_fn)
-        self.prior_fuse_6 = PriorInitFusionLayer(
-            4*base_ch, 4*base_ch, block_num=2, task_prior_num=tn, modality_prior_num=mn
-        )
-        self.up3 = up_block(4*base_ch, 2*base_ch, num_block=num_block[0], block=block_fn,
-                            up_scale=scale[1], kernel_size=kernel_size[1], norm=norm_fn)
-        self.up4 = up_block(2*base_ch, base_ch, num_block=2, block=block_fn,
-                            up_scale=scale[0], kernel_size=kernel_size[0], norm=norm_fn)
+        return out 
 
-        # classification heads
-        self.out = HierarchyPriorClassifier(34*base_ch, base_ch)
-        self.mod_out = ModalityClassifier(34*base_ch, mn)
 
-        # text embedding linear heads: embed_dim -> text_prior_num * prior_dim_per_scale
-        self.text_heads = nn.ModuleList([
-            nn.Linear(embed_dim, text_prior_num * (4 * base_ch)),
-            nn.Linear(embed_dim, text_prior_num * (8 * base_ch)),
-            nn.Linear(embed_dim, text_prior_num * (10 * base_ch)),
-            nn.Linear(embed_dim, text_prior_num * (8 * base_ch)),
-            nn.Linear(embed_dim, text_prior_num * (4 * base_ch)),
-        ])
+class down_block(nn.Module):
+    def __init__(self, in_ch, out_ch, num_block, block=BasicBlock, kernel_size=[3,3,3], down_scale=[2,2,2], pool=True, norm=nn.BatchNorm3d):
+        super().__init__() 
+        
+        if isinstance(kernel_size, int):
+            kernel_size = [kernel_size] * 3
+        if isinstance(down_scale, int):
+            down_scale = [down_scale] * 3
 
-    def forward(self, x, tgt_idx, mod_idx, raw_text_embeds):
-        # x: (B, in_ch, D, H, W)
-        # raw_text_embeds: (B, embed_dim)
-        tn = tgt_idx.shape[1]
-        mn = mod_idx.shape[1]
-        B = raw_text_embeds.size(0)
+        block_list = []
 
-        # build text_prior tokens for each scale
-        prior_dims = [4 * self.base_ch, 8 * self.base_ch,
-                      10 * self.base_ch, 8 * self.base_ch,
-                      4 * self.base_ch]
-        text_priors = []
-        for head, pd in zip(self.text_heads, prior_dims):
-            flat = head(raw_text_embeds)  # (B, text_prior_num * pd)
-            text_priors.append(flat.view(B, self.text_prior_num, pd))
+        if pool:
+            block_list.append(nn.MaxPool3d(down_scale))
+            block_list.append(block(in_ch, out_ch, kernel_size=kernel_size, norm=norm))
+        else:
+            block_list.append(block(in_ch, out_ch, stride=down_scale, kernel_size=kernel_size, norm=norm))
 
-        # encoder + fusion 2
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x3, priors_2 = self.prior_init_fuse_2(x3, tgt_idx, mod_idx, text_priors[0])
+        for i in range(num_block-1):
+            block_list.append(block(out_ch, out_ch, stride=1, kernel_size=kernel_size, norm=norm))
 
-        # encoder + fusion 3
-        x4 = self.down3(x3)
-        x4, priors_3 = self.prior_init_fuse_3(x4, tgt_idx, mod_idx, text_priors[1])
+        self.conv = nn.Sequential(*block_list)
+    def forward(self, x):
+        return self.conv(x)
 
-        # encoder + fusion 4
-        x5 = self.down4(x4)
-        x5, priors_4 = self.prior_init_fuse_4(x5, tgt_idx, mod_idx, text_priors[2])
+class up_block(nn.Module):
+    def __init__(self, in_ch, out_ch, num_block, block=BasicBlock, kernel_size=[3,3,3], up_scale=[2,2,2], norm=nn.BatchNorm3d):
+        super().__init__()
+        
+        if isinstance(kernel_size, int):
+            kernel_size = [kernel_size] * 3
+        if isinstance(up_scale, int):
+            up_scale = [up_scale] * 3
 
-        # decoder + fusion 5
-        out = self.up1(x5, x4)
-        out, priors_5 = self.prior_fuse_5(out, tgt_idx, mod_idx, text_priors[3])
+        self.up_scale = up_scale
 
-        # decoder + fusion 6
-        out = self.up2(out, x3)
-        out, priors_6 = self.prior_fuse_6(out, tgt_idx, mod_idx, text_priors[4])
 
-        # finish decoding
-        out = self.up3(out, x2)
-        out = self.up4(out, x1)
+        block_list = []
 
-        # segmentation head: use task priors
-        task_priors = [p[:, :tn, :] for p in [priors_2, priors_3, priors_4, priors_5, priors_6]]
-        seg_out = self.out(out, task_priors)
+        block_list.append(block(in_ch+out_ch, out_ch, kernel_size=kernel_size, norm=norm))
+        for i in range(num_block-1):
+            block_list.append(block(out_ch, out_ch, kernel_size=kernel_size, norm=norm))
 
-        # modality head: use modality priors
-        mod_priors = [p[:, tn:tn+mn, :] for p in [priors_2, priors_3, priors_4, priors_5, priors_6]]
-        mod_out = self.mod_out(mod_priors)
+        self.conv = nn.Sequential(*block_list)
 
-        return seg_out, mod_out
+    def forward(self, x1, x2):
+        input_dtype = x1.dtype
+        # F.interpolate trilinear doesn't support bfloat16, so need to cast to float32 for upsampling then cast back if using amp training
+        x1 = F.interpolate(x1.float(), size=x2.shape[2:], mode='trilinear', align_corners=True)
+        x1 = x1.to(input_dtype)
+        out = torch.cat([x2, x1], dim=1)
+
+        out = self.conv(out)
+
+        return out
+
+class DualPreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.fn = fn
+    def forward(self, x1, x2, **kwargs):
+        return self.fn(self.norm1(x1), self.norm2(x2), **kwargs)
+
+
+class PriorAttentionBlock(nn.Module):
+    def __init__(self, feat_dim, heads=4, dim_head=64, attn_drop=0., proj_drop=0.):
+        super().__init__()
+
+        self.inner_dim = dim_head * heads
+        self.feat_dim = feat_dim
+        self.heads = heads
+        self.scale = dim_head ** (-0.5)
+        self.dim_head = dim_head
+
+        dim = feat_dim
+        mlp_dim = dim * 4
+
+        # update priors by aggregating from the feature map
+        self.prior_aggregate_block = DualPreNorm(dim, CrossAttention(dim, heads, dim_head, attn_drop, proj_drop))
+        self.prior_ffn = PreNorm(dim, Mlp(dim, mlp_dim, dim, drop=proj_drop))
+
+        # update the feature map by injecting knowledge from the priors
+        self.feat_aggregate_block = DualPreNorm(dim, CrossAttention(dim, heads, dim_head, attn_drop, proj_drop))
+        self.feat_ffn = PreNorm(dim, Mlp(dim, mlp_dim, dim, drop=proj_drop))
+
+
+    def forward(self, x1, x2):
+        # x1: image feature map, x2: priors
+
+        x2 = self.prior_aggregate_block(x2, x1) + x2
+        x2 = self.prior_ffn(x2) + x2
+
+        x1 = self.feat_aggregate_block(x1, x2) + x1
+        x1 = self.feat_ffn(x1) + x1
+
+        return x1, x2
+
+
+class PriorInitFusionLayer(nn.Module):
+    def __init__(self, feat_dim, prior_dim, block_num=2, task_prior_num=42, modality_prior_num=2, l=10):
+        super().__init__()
+        
+        # random initialize the priors
+        self.task_prior = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(task_prior_num+1, prior_dim))) # +1 for null token
+        self.modality_prior = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(modality_prior_num, l, prior_dim)))
+
+        self.attn_layers = nn.ModuleList([])
+        for i in range(block_num):
+            self.attn_layers.append(PriorAttentionBlock(feat_dim, heads=feat_dim//32, dim_head=32, attn_drop=0, proj_drop=0))
+
+    # def forward(self, x, tgt_idx, mod_idx):
+    def forward(self, x, tgt_idx, mod_idx, text_priors):
+        # x: image feature map, tgt_idx: target task index, mod_idx: modality index
+        B, C, D, H, W = x.shape
+        
+        task_prior_list = []
+        modality_prior_list = []
+        # prior selection
+        for i in range(B):
+            idxs = tgt_idx[i]
+            task_prior_list.append(self.task_prior[idxs, :])
+            modality_prior_list.append(self.modality_prior[mod_idx[i], :, :])
+        
+
+        task_priors = torch.stack(task_prior_list)
+        modality_priors = torch.stack(modality_prior_list)
+        modality_priors = modality_priors.squeeze(1)
+
+        priors = torch.cat([task_priors, modality_priors], dim=1)
+        
+        #x = rearrange(x, 'b c d h w -> b (d h w) c', d=D, h=H, w=W)
+        b, c, d, h, w = x.shape
+        x = x.view(b, c, -1)
+        x = x.permute(0, 2, 1).contiguous()
+
+        
+        for layer in self.attn_layers:
+            x, priors = layer(x, priors)
+        
+        #x = rearrange(x, 'b (d h w) c -> b c d h w', d=D, h=H, w=W, c=C)
+        x = x.permute(0, 2, 1)
+        x = x.view(b, c, d, h, w).contiguous()
+
+        return x, priors
