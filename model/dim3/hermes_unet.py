@@ -28,21 +28,22 @@ class Hermes_UNet(nn.Module):
         Args:
             in_ch: the num of input channel
             base_ch: the num of channels in the entry level
-            scale: should be a list to indicate the downsample scale along each axis 
-                in each level, e.g. [1, 1, 2, 2] such that all axis use the same scale
-                or [[1,2,2], [2,2,2], [2,2,2], [2,2,2]] for difference scale on each axis
-            kernel_size: the 3D kernel size of each level
-                e.g. [3,3,3,3] or [[1,3,3], [1,3,3], [3,3,3], [3,3,3]]
-            num_classes: the target class number
-            block: 'ConvNormAct' for origin UNet, 'BasicBlock' for ResUNet
-            num_block: number of blocks in each stage
-            pool: use maxpool or use strided conv for downsample
-            norm: the norm layer type, bn or in
-            tn: the number of task priors
-            mn: the number of modality priors
-            embed_dim: dimensionality of input text embeddings
-            text_prior_num: how many text-prior tokens per scale
+            scale: list indicating downsample scale per level
+            kernel_size: 3D kernel sizes per level
+            block: block type
+            num_block: number of blocks per stage
+            pool: pooling vs strided conv
+            norm: normalization type
+            tn: number of task priors
+            mn: number of modality priors
+            embed_dim: dimension of input text embeddings
+            text_prior_num: number of text-prior tokens per scale
         '''
+        # store for forward
+        self.base_ch = base_ch
+        self.embed_dim = embed_dim
+        self.text_prior_num = text_prior_num
+
         block = get_block(block)
         norm = get_norm(norm)
     
@@ -95,8 +96,7 @@ class Hermes_UNet(nn.Module):
         self.out = HierarchyPriorClassifier(34*base_ch, base_ch)
         self.mod_out = ModalityClassifier(34*base_ch, mn)
 
-        # OpenAI text embedding projections
-        # One linear head per fusion scale: embed_dim -> (text_prior_num * prior_dim_for_scale)
+        # OpenAI text embedding projections: one head per fusion stage
         self.text_heads = nn.ModuleList([
             nn.Linear(embed_dim, text_prior_num * (4*base_ch)),
             nn.Linear(embed_dim, text_prior_num * (8*base_ch)),
@@ -104,21 +104,18 @@ class Hermes_UNet(nn.Module):
             nn.Linear(embed_dim, text_prior_num * (8*base_ch)),
             nn.Linear(embed_dim, text_prior_num * (4*base_ch)),
         ])
-        self.embed_dim = embed_dim
-        self.text_prior_num = text_prior_num
-
 
     def forward(self, x, tgt_idx, mod_idx, raw_text_embeds):
         # raw_text_embeds: (B, embed_dim)
-        tn = tgt_idx.shape[1]  # number of task prior tokens
-        mn = mod_idx.shape[1]  # number of modality prior tokens
+        tn = tgt_idx.shape[1]
+        mn = mod_idx.shape[1]
 
-        # Prepare dynamic text priors for each fusion stage
+        # Prepare dynamic text priors for each fusion scale
         B = raw_text_embeds.size(0)
-        prior_dims = [4*base_ch, 8*base_ch, 10*base_ch, 8*base_ch, 4*base_ch]
+        prior_dims = [4*self.base_ch, 8*self.base_ch, 10*self.base_ch, 8*self.base_ch, 4*self.base_ch]
         text_priors = []
         for head, pd in zip(self.text_heads, prior_dims):
-            flat = head(raw_text_embeds)               # (B, text_prior_num * pd)
+            flat = head(raw_text_embeds)             # (B, text_prior_num * pd)
             text_priors.append(flat.view(B, self.text_prior_num, pd))
 
         x1 = self.inc(x)
@@ -140,25 +137,23 @@ class Hermes_UNet(nn.Module):
 
         out = self.up3(out, x2)
         out = self.up4(out, x1)
-        
-        # Select task posterior tokens for segmentation
+
+        # Task priors for segmentation
         task_priors_2 = priors_2[:, :tn, :]
         task_priors_3 = priors_3[:, :tn, :]
         task_priors_4 = priors_4[:, :tn, :]
         task_priors_5 = priors_5[:, :tn, :]
         task_priors_6 = priors_6[:, :tn, :]
+        task_list = [task_priors_2, task_priors_3, task_priors_4, task_priors_5, task_priors_6]
+        out = self.out(out, task_list)
 
-        task_prior_list = [task_priors_2, task_priors_3, task_priors_4, task_priors_5, task_priors_6]
-        out = self.out(out, task_prior_list)
-        
-        # Select modality posterior tokens for modality classification
+        # Modality priors for modality classification
         mod_priors_2 = priors_2[:, tn:tn+mn, :]
         mod_priors_3 = priors_3[:, tn:tn+mn, :]
         mod_priors_4 = priors_4[:, tn:tn+mn, :]
         mod_priors_5 = priors_5[:, tn:tn+mn, :]
         mod_priors_6 = priors_6[:, tn:tn+mn, :]
-
-        mod_prior_list = [mod_priors_2, mod_priors_3, mod_priors_4, mod_priors_5, mod_priors_6]
-        mod_out = self.mod_out(mod_prior_list)
+        mod_list = [mod_priors_2, mod_priors_3, mod_priors_4, mod_priors_5, mod_priors_6]
+        mod_out = self.mod_out(mod_list)
 
         return out, mod_out
